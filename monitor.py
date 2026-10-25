@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Многофакторный сканер крипто-сигналов (Bybit, Binance, OKX).
-
-Анализирует RSI, EMA, объёмы и Order Blocks на нескольких таймфреймах.
-Выдаёт краткий сигнал: монета, направление, TP, SL.
-"""
 import json
 import os
 import sys
@@ -14,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import ccxt
 import pandas as pd
-import pandas_ta_classic as ta
 
 # ---------- конфигурация ----------
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
@@ -23,55 +17,74 @@ FIXED_COINS = None if COINS_ENV in ("", "ALL") else [c.strip() for c in COINS_EN
 
 def load_params():
     return {
-        "timeframes": ["5m", "15m", "1h"],      # анализируем три ТФ
-        "limit": 200,                            # свечей на ТФ
+        "timeframes": ["5m", "15m", "1h"],
+        "limit": 200,
         "rsi_n": 14,
-        "rsi_long_max": 65,                      # не покупаем выше
-        "rsi_short_min": 35,                     # не шортим ниже
+        "rsi_long_max": 65,
+        "rsi_short_min": 35,
         "ema_fast": 9,
         "ema_slow": 21,
         "ema_trend": 50,
-        "vol_mult": 1.8,                         # всплеск объёма
+        "vol_mult": 1.8,
         "sl_atr_mult": 1.5,
         "rr": 2.0,
         "cooldown_min": 60,
         "max_alerts": 5,
         "min_turnover_usd": 20_000_000,
         "workers": 6,
-        "min_score": 3,                          # минимум совпавших факторов
+        "min_score": 3,
     }
 
-# ---------- биржи через CCXT ----------
+# ---------- индикаторы на чистом pandas ----------
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    return true_range.rolling(period).mean()
+
+def add_indicators(df, P):
+    df = df.copy()
+    df["rsi"] = rsi(df["close"], P["rsi_n"])
+    df["ema_fast"] = ema(df["close"], P["ema_fast"])
+    df["ema_slow"] = ema(df["close"], P["ema_slow"])
+    df["ema_trend"] = ema(df["close"], P["ema_trend"])
+    df["atr"] = atr(df, 14)
+    df["vol_ma"] = df["volume"].rolling(P["rsi_n"]).mean()
+    return df
+
+# ---------- биржи ----------
 def get_exchange(name):
-    """Возвращает объект биржи CCXT с публичным доступом."""
-    ex = getattr(ccxt, name)({
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},      # фьючерсы/перпетуалы
-    })
-    return ex
+    return getattr(ccxt, name)({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 
 def fetch_universe(exchange, min_turnover, max_coins):
-    """Список ликвидных USDT-перпетуалов с оборотом > min_turnover."""
     try:
         markets = exchange.load_markets()
         tickers = exchange.fetch_tickers()
-    except Exception as e:
-        print(f"Ошибка загрузки рынков {exchange.id}: {e}")
+    except Exception:
         return []
     rows = []
     for sym, m in markets.items():
         if not m.get("swap") or m.get("quote") != "USDT":
             continue
         t = tickers.get(sym)
-        if not t or not t.get("quoteVolume"):
-            continue
-        if t["quoteVolume"] >= min_turnover:
+        if t and t.get("quoteVolume") and t["quoteVolume"] >= min_turnover:
             rows.append((t["quoteVolume"], sym))
     rows.sort(reverse=True)
     return [sym for _, sym in rows[:max_coins]]
 
 def fetch_ohlcv(exchange, symbol, timeframe, limit):
-    """Свечи в виде DataFrame."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -80,19 +93,8 @@ def fetch_ohlcv(exchange, symbol, timeframe, limit):
     except Exception:
         return None
 
-# ---------- индикаторы и паттерны ----------
-def add_indicators(df, P):
-    df = df.copy()
-    df["rsi"] = ta.rsi(df["close"], length=P["rsi_n"])
-    df["ema_fast"] = ta.ema(df["close"], length=P["ema_fast"])
-    df["ema_slow"] = ta.ema(df["close"], length=P["ema_slow"])
-    df["ema_trend"] = ta.ema(df["close"], length=P["ema_trend"])
-    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-    df["vol_ma"] = df["volume"].rolling(P["rsi_n"]).mean()
-    return df
-
+# ---------- анализ ----------
 def find_order_block(df, bullish=True):
-    """Ищет последний Order Block: противоположная свеча перед импульсом из 3 свечей."""
     for i in range(len(df) - 3, 1, -1):
         prior = df.iloc[i - 1]
         trio = df.iloc[i:i+3]
@@ -107,7 +109,6 @@ def find_order_block(df, bullish=True):
     return None
 
 def analyze_symbol(symbol, exchange, P):
-    """Возвращает сигнал или None."""
     dfs = {}
     for tf in P["timeframes"]:
         df = fetch_ohlcv(exchange, symbol, tf, P["limit"])
@@ -122,181 +123,102 @@ def analyze_symbol(symbol, exchange, P):
     last15 = df15.iloc[-1]
     last1h = df1h.iloc[-1]
 
-    # --- Фильтр тренда по 1h ---
     trend_up = last1h["close"] > last1h["ema_trend"]
     trend_down = last1h["close"] < last1h["ema_trend"]
 
-    # --- Условия для LONG ---
-    long_score = 0
-    long_reasons = []
-    if trend_up:
-        long_score += 1
-        long_reasons.append("1h trend up")
-    if last5["rsi"] < P["rsi_long_max"] and last15["rsi"] < P["rsi_long_max"]:
-        long_score += 1
-        long_reasons.append("RSI not overbought")
+    long_score, short_score = 0, 0
+    if trend_up: long_score += 1
+    if trend_down: short_score += 1
+    if last5["rsi"] < P["rsi_long_max"] and last15["rsi"] < P["rsi_long_max"]: long_score += 1
+    if last5["rsi"] > P["rsi_short_min"] and last15["rsi"] > P["rsi_short_min"]: short_score += 1
     if last5["volume"] > P["vol_mult"] * last5["vol_ma"]:
         long_score += 1
-        long_reasons.append("volume spike")
+        short_score += 1
+    
     ob = find_order_block(df5, bullish=True)
-    if ob and last5["low"] <= ob["high"] and last5["close"] > ob["low"]:
-        long_score += 1
-        long_reasons.append("bullish OB")
-    if last5["ema_fast"] > last5["ema_slow"]:
-        long_score += 1
-        long_reasons.append("EMA 9>21")
-
-    # --- Условия для SHORT ---
-    short_score = 0
-    short_reasons = []
-    if trend_down:
-        short_score += 1
-        short_reasons.append("1h trend down")
-    if last5["rsi"] > P["rsi_short_min"] and last15["rsi"] > P["rsi_short_min"]:
-        short_score += 1
-        short_reasons.append("RSI not oversold")
-    if last5["volume"] > P["vol_mult"] * last5["vol_ma"]:
-        short_score += 1
-        short_reasons.append("volume spike")
+    if ob and last5["low"] <= ob["high"] and last5["close"] > ob["low"]: long_score += 1
     ob_short = find_order_block(df5, bullish=False)
-    if ob_short and last5["high"] >= ob_short["low"] and last5["close"] < ob_short["high"]:
-        short_score += 1
-        short_reasons.append("bearish OB")
-    if last5["ema_fast"] < last5["ema_slow"]:
-        short_score += 1
-        short_reasons.append("EMA 9<21")
+    if ob_short and last5["high"] >= ob_short["low"] and last5["close"] < ob_short["high"]: short_score += 1
+    
+    if last5["ema_fast"] > last5["ema_slow"]: long_score += 1
+    if last5["ema_fast"] < last5["ema_slow"]: short_score += 1
 
-    # --- Выбор направления ---
-    side = None
-    score = 0
-    reasons = []
+    side, score = None, 0
     if long_score >= P["min_score"] and long_score > short_score:
-        side = "LONG"
-        score = long_score
-        reasons = long_reasons
+        side, score = "LONG", long_score
     elif short_score >= P["min_score"] and short_score > long_score:
-        side = "SHORT"
-        score = short_score
-        reasons = short_reasons
+        side, score = "SHORT", short_score
     else:
         return None
 
-    # --- Расчёт TP/SL ---
     entry = last5["close"]
-    atr = last5["atr"]
-    dist = P["sl_atr_mult"] * atr if atr and atr > 0 else entry * 0.01
-    if side == "LONG":
-        sl = entry - dist
-        tp = entry + P["rr"] * dist
-    else:
-        sl = entry + dist
-        tp = entry - P["rr"] * dist
+    dist = P["sl_atr_mult"] * last5["atr"] if last5["atr"] and last5["atr"] > 0 else entry * 0.01
+    sl = entry - dist if side == "LONG" else entry + dist
+    tp = entry + P["rr"] * dist if side == "LONG" else entry - P["rr"] * dist
 
-    return {
-        "symbol": symbol.split("/")[0],
-        "side": side,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "score": score,
-        "reasons": reasons,
-        "exchange": exchange.id,
-    }
+    return {"symbol": symbol.split("/")[0], "side": side, "entry": entry, "tp": tp, "sl": sl, "score": score}
 
-# ---------- сканирование ----------
 def scan_all(P):
-    """Сканирует все доступные биржи, возвращает лучшие сигналы."""
     exchanges = []
     for name in ["bybit", "binance", "okx"]:
         try:
             ex = get_exchange(name)
             ex.load_markets()
             exchanges.append(ex)
-        except Exception as e:
-            print(f"Биржа {name} недоступна: {e}")
+        except Exception:
+            pass
 
-    if not exchanges:
-        return []
-
-    # Берём юниверс с Bybit как основной (пользователь торгует там)
+    if not exchanges: return []
     primary = next((e for e in exchanges if e.id == "bybit"), exchanges[0])
     universe = fetch_universe(primary, P["min_turnover_usd"], 100)
-    if FIXED_COINS:
-        universe = [s for s in universe if s.split("/")[0] in FIXED_COINS]
+    if FIXED_COINS: universe = [s for s in universe if s.split("/")[0] in FIXED_COINS]
 
     def work(sym):
-        # Пробуем получить сигнал с каждой биржи, где есть символ
         for ex in exchanges:
-            if sym not in ex.symbols:
-                continue
-            try:
-                sig = analyze_symbol(sym, ex, P)
-                if sig:
-                    return sig
-            except Exception:
-                continue
+            if sym in ex.symbols:
+                try:
+                    sig = analyze_symbol(sym, ex, P)
+                    if sig: return sig
+                except Exception: continue
         return None
 
-    signals = []
     with ThreadPoolExecutor(max_workers=P["workers"]) as pool:
         results = list(pool.map(work, universe))
-    for sig in results:
-        if sig:
-            signals.append(sig)
-
-    # Сортируем по количеству совпавших факторов
+    signals = [s for s in results if s]
     signals.sort(key=lambda s: s["score"], reverse=True)
     return signals[:P["max_alerts"]]
 
 # ---------- отправка ----------
 def build_message(sig):
     arrow = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
-    return "\n".join([
-        f"Монета: {sig['symbol']}USDT | {arrow}",
-        f"TP: {sig['tp']:.6g}",
-        f"SL: {sig['sl']:.6g}",
-    ])
+    return f"Монета: {sig['symbol']}USDT | {arrow}\nTP: {sig['tp']:.6g}\nSL: {sig['sl']:.6g}"
 
 def send_telegram(token, chat_id, text):
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data=data,
-        headers={"User-Agent": "signal-bot"},
-    )
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
     with urllib.request.urlopen(req, timeout=15) as r:
-        resp = json.loads(r.read().decode())
-        if not resp.get("ok"):
-            raise RuntimeError(f"telegram: {resp}")
+        if not json.loads(r.read().decode()).get("ok"): raise RuntimeError("telegram error")
 
-# ---------- состояние (кулдаун) ----------
 def load_state(path):
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {"sent": {}}
+        with open(path) as f: return json.load(f)
+    except: return {"sent": {}}
 
 def save_state(path, state):
-    with open(path, "w") as f:
-        json.dump(state, f, indent=1)
+    with open(path, "w") as f: json.dump(state, f, indent=1)
 
 # ---------- main ----------
 def main(argv):
     P = load_params()
-    dry = "--dry" in argv
-    test = "--test" in argv
-
+    dry, test = "--dry" in argv, "--test" in argv
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
     if test:
         msg = "✅ Бот запущен. Многофакторный анализ активен."
-        if dry or not token or not chat_id:
-            print(msg)
-        else:
+        if not dry and token and chat_id:
             send_telegram(token, chat_id, msg)
-            print("Тестовое сообщение отправлено.")
+        print(msg)
         return 0
 
     signals = scan_all(P)
@@ -306,22 +228,17 @@ def main(argv):
 
     state = load_state(STATE_FILE)
     now = time.time()
-    sent = 0
     for sig in signals:
         key = f"{sig['symbol']}|{sig['side']}"
-        if now - state["sent"].get(key, 0) < P["cooldown_min"] * 60:
-            continue
+        if now - state["sent"].get(key, 0) < P["cooldown_min"] * 60: continue
         msg = build_message(sig)
-        if dry or not token or not chat_id:
-            print(msg + "\n---")
-        else:
+        if not dry and token and chat_id:
             send_telegram(token, chat_id, msg)
+        else:
+            print(msg + "\n---")
         state["sent"][key] = now
-        sent += 1
-        print(f"Отправлен сигнал: {sig['symbol']} {sig['side']} (score={sig['score']})")
-
-    if not dry and sent > 0:
-        save_state(STATE_FILE, state)
+    
+    if not dry: save_state(STATE_FILE, state)
     return 0
 
 if __name__ == "__main__":
