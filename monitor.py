@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import ccxt
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 
 # ---------- конфигурация ----------
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
