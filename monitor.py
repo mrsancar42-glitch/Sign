@@ -6,11 +6,11 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import ccxt
 import pandas as pd
 
-# ---------- конфигурация ----------
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 COINS_ENV = os.environ.get("COINS", "ALL").upper()
 FIXED_COINS = None if COINS_ENV in ("", "ALL") else [c.strip() for c in COINS_ENV.split(",")]
@@ -20,22 +20,22 @@ def load_params():
         "timeframes": ["5m", "15m", "1h"],
         "limit": 200,
         "rsi_n": 14,
-        "rsi_long_max": 70,
-        "rsi_short_min": 30,
+        "rsi_long_max": 65,
+        "rsi_short_min": 35,
         "ema_fast": 9,
         "ema_slow": 21,
         "ema_trend": 50,
-        "vol_mult": 1.3,
+        "vol_mult": 1.5, # Уже понизили
         "sl_atr_mult": 1.5,
         "rr": 2.0,
-        "cooldown_min": 60,
-        "max_alerts": 5,
+        "cooldown_min": 15, # Понизили, чтобы чаще слал
+        "max_alerts": 10,   # Увеличили лимит
         "min_turnover_usd": 20_000_000,
         "workers": 6,
-        "min_score": 2,
+        "min_score": 2,     # Понизили для теста
     }
 
-# ---------- индикаторы на чистом pandas ----------
+# ---------- индикаторы ----------
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -108,7 +108,7 @@ def find_order_block(df, bullish=True):
             return {"high": prior["high"], "low": prior["low"]}
     return None
 
-def analyze_symbol(symbol, exchange, P):
+def analyze_symbol(symbol, exchange, P, debug=False):
     dfs = {}
     for tf in P["timeframes"]:
         df = fetch_ohlcv(exchange, symbol, tf, P["limit"])
@@ -131,7 +131,9 @@ def analyze_symbol(symbol, exchange, P):
     if trend_down: short_score += 1
     if last5["rsi"] < P["rsi_long_max"] and last15["rsi"] < P["rsi_long_max"]: long_score += 1
     if last5["rsi"] > P["rsi_short_min"] and last15["rsi"] > P["rsi_short_min"]: short_score += 1
-    if last5["volume"] > P["vol_mult"] * last5["vol_ma"]:
+    
+    vol_spike = last5["volume"] > P["vol_mult"] * last5["vol_ma"]
+    if vol_spike:
         long_score += 1
         short_score += 1
     
@@ -142,6 +144,23 @@ def analyze_symbol(symbol, exchange, P):
     
     if last5["ema_fast"] > last5["ema_slow"]: long_score += 1
     if last5["ema_fast"] < last5["ema_slow"]: short_score += 1
+
+    # --- РЕЖИМ ОТЛАДКИ ---
+    if debug:
+        # Если есть всплеск объема, шлем сырые данные
+        if vol_spike:
+            return {
+                "symbol": symbol.split("/")[0],
+                "side": "DEBUG",
+                "score": max(long_score, short_score),
+                "rsi5": last5["rsi"],
+                "rsi15": last15["rsi"],
+                "trend_1h": "UP" if trend_up else ("DOWN" if trend_down else "FLAT"),
+                "volume_ratio": last5["volume"] / last5["vol_ma"],
+                "entry": last5["close"],
+            }
+        return None
+    # --- КОНЕЦ РЕЖИМА ОТЛАДКИ ---
 
     side, score = None, 0
     if long_score >= P["min_score"] and long_score > short_score:
@@ -158,7 +177,7 @@ def analyze_symbol(symbol, exchange, P):
 
     return {"symbol": symbol.split("/")[0], "side": side, "entry": entry, "tp": tp, "sl": sl, "score": score}
 
-def scan_all(P):
+def scan_all(P, debug=False):
     exchanges = []
     for name in ["bybit", "binance", "okx"]:
         try:
@@ -177,7 +196,7 @@ def scan_all(P):
         for ex in exchanges:
             if sym in ex.symbols:
                 try:
-                    sig = analyze_symbol(sym, ex, P)
+                    sig = analyze_symbol(sym, ex, P, debug=debug)
                     if sig: return sig
                 except Exception: continue
         return None
@@ -190,6 +209,14 @@ def scan_all(P):
 
 # ---------- отправка ----------
 def build_message(sig):
+    if sig["side"] == "DEBUG":
+        return (
+            f"🔎 [DEBUG] {sig['symbol']}USDT\n"
+            f"Тренд 1H: {sig['trend_1h']} | Vol x{sig['volume_ratio']:.1f}\n"
+            f"RSI 5m: {sig['rsi5']:.0f} | RSI 15m: {sig['rsi15']:.0f}\n"
+            f"Score: {sig['score']}/5 | Цена: {sig['entry']:.6g}"
+        )
+    
     arrow = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
     return f"Монета: {sig['symbol']}USDT | {arrow}\nTP: {sig['tp']:.6g}\nSL: {sig['sl']:.6g}"
 
@@ -210,18 +237,20 @@ def save_state(path, state):
 # ---------- main ----------
 def main(argv):
     P = load_params()
-    dry, test = "--dry" in argv, "--test" in argv
+    dry = "--dry" in argv
+    test = "--test" in argv
+    debug = "--debug" in argv # Наш новый флаг
+    
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
     if test:
         msg = "✅ Бот запущен. Многофакторный анализ активен."
-        if not dry and token and chat_id:
-            send_telegram(token, chat_id, msg)
+        if not dry and token and chat_id: send_telegram(token, chat_id, msg)
         print(msg)
         return 0
 
-    signals = scan_all(P)
+    signals = scan_all(P, debug=debug)
     if not signals:
         print("Сигналов не найдено.")
         return 0
