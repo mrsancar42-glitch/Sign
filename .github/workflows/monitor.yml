@@ -1,18 +1,21 @@
 name: monitor
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       test:
         description: "Отправить тестовое сообщение"
         type: boolean
         default: false
+
 permissions:
   contents: write
+
 concurrency:
   group: monitor
   cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -35,7 +38,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           COINS: "ALL"
-        run: python3 monitor.py --debug
+        run: python3 monitor.py ${{ inputs.test && '--test' || '' }}
 
       - name: Save state
         run: |
