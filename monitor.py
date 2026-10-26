@@ -117,47 +117,27 @@ def analyze_symbol(symbol, exchange, P, debug=False):
         dfs[tf] = add_indicators(df, P)
 
     df5 = dfs["5m"]
-    df15 = dfs["15m"]
-    df1h = dfs["1h"]
     last5 = df5.iloc[-1]
-    last15 = df15.iloc[-1]
-    last1h = df1h.iloc[-1]
-
-    trend_up = last1h["close"] > last1h["ema_trend"]
-    trend_down = last1h["close"] < last1h["ema_trend"]
-
-    long_score, short_score = 0, 0
-    if trend_up: long_score += 1
-    if trend_down: short_score += 1
-    if last5["rsi"] < P["rsi_long_max"] and last15["rsi"] < P["rsi_long_max"]: long_score += 1
-    if last5["rsi"] > P["rsi_short_min"] and last15["rsi"] > P["rsi_short_min"]: short_score += 1
     
-    vol_spike = last5["volume"] > P["vol_mult"] * last5["vol_ma"]
-    if vol_spike:
-        long_score += 1
-        short_score += 1
-    
-    ob = find_order_block(df5, bullish=True)
-    if ob and last5["low"] <= ob["high"] and last5["close"] > ob["low"]: long_score += 1
-    ob_short = find_order_block(df5, bullish=False)
-    if ob_short and last5["high"] >= ob_short["low"] and last5["close"] < ob_short["high"]: short_score += 1
-    
-    if last5["ema_fast"] > last5["ema_slow"]: long_score += 1
-    if last5["ema_fast"] < last5["ema_slow"]: short_score += 1
-
-    # --- РЕЖИМ ОТЛАДКИ ---
+    # --- УЛЬТРА-ОТЛАДКА ---
     if debug:
-        # Если есть всплеск объема, шлем сырые данные
-        if vol_spike:
+        # Считаем текущий объем относительно среднего
+        vol_ratio = last5["volume"] / last5["vol_ma"] if last5["vol_ma"] > 0 else 0
+        
+        # Отправляем, если объем выше среднего (1.1) или если это просто огромный объем
+        if vol_ratio > 1.1: 
             return {
                 "symbol": symbol.split("/")[0],
                 "side": "DEBUG",
-                "score": max(long_score, short_score),
-                "rsi5": last5["rsi"],
-                "rsi15": last15["rsi"],
-                "trend_1h": "UP" if trend_up else ("DOWN" if trend_down else "FLAT"),
-                "volume_ratio": last5["volume"] / last5["vol_ma"],
+                "score": int(vol_ratio * 2), # Для сортировки
+                "volume_ratio": vol_ratio,
                 "entry": last5["close"],
+            }
+        return None
+    # ---------------------
+
+    # Если не debug, то стандартная логика (как была)
+    # ... (остальной код функции analyze_symbol оставь без изменений) ...
             }
         return None
     # --- КОНЕЦ РЕЖИМА ОТЛАДКИ ---
