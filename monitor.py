@@ -6,8 +6,6 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-
 import ccxt
 import pandas as pd
 
@@ -17,58 +15,21 @@ FIXED_COINS = None if COINS_ENV in ("", "ALL") else [c.strip() for c in COINS_EN
 
 def load_params():
     return {
-        "timeframes": ["5m", "15m", "1h"],
-        "limit": 200,
-        "rsi_n": 14,
-        "rsi_long_max": 65,
-        "rsi_short_min": 35,
-        "ema_fast": 9,
-        "ema_slow": 21,
-        "ema_trend": 50,
-        "vol_mult": 1.5, # Уже понизили
-        "sl_atr_mult": 1.5,
-        "rr": 2.0,
-        "cooldown_min": 15, # Понизили, чтобы чаще слал
-        "max_alerts": 10,   # Увеличили лимит
-        "min_turnover_usd": 20_000_000,
+        "timeframe": "15m",      
+        "limit": 150,            
+        "swing_length": 5,       
+        "ob_lookback": 20,       
+        "cooldown_min": 120,     
+        "max_alerts": 3,         
+        "min_turnover_usd": 30_000_000, 
         "workers": 6,
-        "min_score": 2,     # Понизили для теста
     }
 
-# ---------- индикаторы ----------
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    return true_range.rolling(period).mean()
-
-def add_indicators(df, P):
-    df = df.copy()
-    df["rsi"] = rsi(df["close"], P["rsi_n"])
-    df["ema_fast"] = ema(df["close"], P["ema_fast"])
-    df["ema_slow"] = ema(df["close"], P["ema_slow"])
-    df["ema_trend"] = ema(df["close"], P["ema_trend"])
-    df["atr"] = atr(df, 14)
-    df["vol_ma"] = df["volume"].rolling(P["rsi_n"]).mean()
-    return df
-
-# ---------- биржи ----------
+# ---------- Биржи ----------
 def get_exchange(name):
     return getattr(ccxt, name)({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 
-def fetch_universe(exchange, min_turnover, max_coins):
+def fetch_universe(exchange, min_turnover, max_coins=80):
     try:
         markets = exchange.load_markets()
         tickers = exchange.fetch_tickers()
@@ -88,76 +49,103 @@ def fetch_ohlcv(exchange, symbol, timeframe, limit):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         return df
     except Exception:
         return None
 
-# ---------- анализ ----------
-def find_order_block(df, bullish=True):
-    for i in range(len(df) - 3, 1, -1):
-        prior = df.iloc[i - 1]
-        trio = df.iloc[i:i+3]
-        if bullish:
-            opposite = prior["close"] < prior["open"]
-            continuation = all(trio["close"] > trio["open"])
-        else:
-            opposite = prior["close"] > prior["open"]
-            continuation = all(trio["close"] < trio["open"])
-        if opposite and continuation:
-            return {"high": prior["high"], "low": prior["low"]}
+# ---------- SMC Логика ----------
+def find_swings(df, length=5):
+    swings = []
+    for i in range(length, len(df) - length):
+        if df['high'].iloc[i] == df['high'].iloc[i-length:i+length+1].max():
+            swings.append({'type': 'high', 'price': df['high'].iloc[i], 'index': i})
+        elif df['low'].iloc[i] == df['low'].iloc[i-length:i+length+1].min():
+            swings.append({'type': 'low', 'price': df['low'].iloc[i], 'index': i})
+    return swings
+
+def analyze_smc(symbol, exchange, P):
+    df = fetch_ohlcv(exchange, symbol, P["timeframe"], P["limit"])
+    if df is None or len(df) < 50:
+        return None
+
+    swings = find_swings(df, P["swing_length"])
+    if len(swings) < 2:
+        return None
+
+    current_price = df['close'].iloc[-1]
+    last_swing_high = next((s for s in reversed(swings) if s['type'] == 'high'), None)
+    last_swing_low = next((s for s in reversed(swings) if s['type'] == 'low'), None)
+
+    if not last_swing_high or not last_swing_low:
+        return None
+
+    recent = df.iloc[-3:]
+
+    # СЦЕНАРИЙ 1: LONG (BOS вверх + откат к бычьему OB)
+    if last_swing_high['index'] > last_swing_low['index']:
+        for i in range(len(df) - 2, max(0, len(df) - P["ob_lookback"]), -1):
+            if df['close'].iloc[i] < df['open'].iloc[i]: # Медвежья свеча
+                if df['high'].iloc[i+1] > df['high'].iloc[i]: # Импульс вверх
+                    ob_high = df['high'].iloc[i]
+                    ob_low = df['low'].iloc[i]
+                    
+                    if recent['low'].min() <= ob_high and current_price > ob_low:
+                        sl = ob_low * 0.998 
+                        tp = last_swing_high['price'] 
+                        
+                        risk = current_price - sl
+                        reward = tp - current_price
+                        if risk > 0 and reward / risk >= 1.5:
+                            return {
+                                "symbol": symbol.split("/")[0],
+                                "side": "LONG",
+                                "entry": current_price,
+                                "tp": tp,
+                                "sl": sl,
+                                "reason": "BOS Up + Bullish OB",
+                                # Детали для анализа
+                                "analysis": (
+                                    f"Структура: Пробой вверх (BOS) на {last_swing_high['price']:.4g}\n"
+                                    f"Зона входа: Бычий OB {ob_low:.4g} - {ob_high:.4g}\n"
+                                    f"Цель: Ликвидность на максимуме {tp:.4g}\n"
+                                    f"Риск/Прибыль: 1:{reward/risk:.1f}"
+                                )
+                            }
+    
+    # СЦЕНАРИЙ 2: SHORT (BOS вниз + откат к медвежьему OB)
+    else:
+        for i in range(len(df) - 2, max(0, len(df) - P["ob_lookback"]), -1):
+            if df['close'].iloc[i] > df['open'].iloc[i]: # Бычья свеча
+                if df['low'].iloc[i+1] < df['low'].iloc[i]: # Импульс вниз
+                    ob_high = df['high'].iloc[i]
+                    ob_low = df['low'].iloc[i]
+                    
+                    if recent['high'].max() >= ob_low and current_price < ob_high:
+                        sl = ob_high * 1.002 
+                        tp = last_swing_low['price'] 
+                        
+                        risk = sl - current_price
+                        reward = current_price - tp
+                        if risk > 0 and reward / risk >= 1.5:
+                            return {
+                                "symbol": symbol.split("/")[0],
+                                "side": "SHORT",
+                                "entry": current_price,
+                                "tp": tp,
+                                "sl": sl,
+                                "reason": "BOS Down + Bearish OB",
+                                # Детали для анализа
+                                "analysis": (
+                                    f"Структура: Пробой вниз (BOS) на {last_swing_low['price']:.4g}\n"
+                                    f"Зона входа: Медвежий OB {ob_low:.4g} - {ob_high:.4g}\n"
+                                    f"Цель: Ликвидность на минимуме {tp:.4g}\n"
+                                    f"Риск/Прибыль: 1:{reward/risk:.1f}"
+                                )
+                            }
     return None
 
-def analyze_symbol(symbol, exchange, P, debug=False):
-    dfs = {}
-    for tf in P["timeframes"]:
-        df = fetch_ohlcv(exchange, symbol, tf, P["limit"])
-        if df is None or len(df) < P["limit"] // 2:
-            return None
-        dfs[tf] = add_indicators(df, P)
-
-    df5 = dfs["5m"]
-    last5 = df5.iloc[-1]
-    
-    # --- УЛЬТРА-ОТЛАДКА ---
-    if debug:
-        # Считаем текущий объем относительно среднего
-        vol_ratio = last5["volume"] / last5["vol_ma"] if last5["vol_ma"] > 0 else 0
-        
-        # Отправляем, если объем выше среднего (1.1) или если это просто огромный объем
-        if vol_ratio > 1.1: 
-            return {
-                "symbol": symbol.split("/")[0],
-                "side": "DEBUG",
-                "score": int(vol_ratio * 2), # Для сортировки
-                "volume_ratio": vol_ratio,
-                "entry": last5["close"],
-            }
-        return None
-    # ---------------------
-
-    # Если не debug, то стандартная логика (как была)
-    # ... (остальной код функции analyze_symbol оставь без изменений) ...
-            }
-        return None
-    # --- КОНЕЦ РЕЖИМА ОТЛАДКИ ---
-
-    side, score = None, 0
-    if long_score >= P["min_score"] and long_score > short_score:
-        side, score = "LONG", long_score
-    elif short_score >= P["min_score"] and short_score > long_score:
-        side, score = "SHORT", short_score
-    else:
-        return None
-
-    entry = last5["close"]
-    dist = P["sl_atr_mult"] * last5["atr"] if last5["atr"] and last5["atr"] > 0 else entry * 0.01
-    sl = entry - dist if side == "LONG" else entry + dist
-    tp = entry + P["rr"] * dist if side == "LONG" else entry - P["rr"] * dist
-
-    return {"symbol": symbol.split("/")[0], "side": side, "entry": entry, "tp": tp, "sl": sl, "score": score}
-
-def scan_all(P, debug=False):
+# ---------- Сканирование ----------
+def scan_all(P):
     exchanges = []
     for name in ["bybit", "binance", "okx"]:
         try:
@@ -169,14 +157,14 @@ def scan_all(P, debug=False):
 
     if not exchanges: return []
     primary = next((e for e in exchanges if e.id == "bybit"), exchanges[0])
-    universe = fetch_universe(primary, P["min_turnover_usd"], 100)
+    universe = fetch_universe(primary, P["min_turnover_usd"])
     if FIXED_COINS: universe = [s for s in universe if s.split("/")[0] in FIXED_COINS]
 
     def work(sym):
         for ex in exchanges:
             if sym in ex.symbols:
                 try:
-                    sig = analyze_symbol(sym, ex, P, debug=debug)
+                    sig = analyze_smc(sym, ex, P)
                     if sig: return sig
                 except Exception: continue
         return None
@@ -184,21 +172,20 @@ def scan_all(P, debug=False):
     with ThreadPoolExecutor(max_workers=P["workers"]) as pool:
         results = list(pool.map(work, universe))
     signals = [s for s in results if s]
-    signals.sort(key=lambda s: s["score"], reverse=True)
     return signals[:P["max_alerts"]]
 
-# ---------- отправка ----------
+# ---------- Отправка ----------
 def build_message(sig):
-    if sig["side"] == "DEBUG":
-        return (
-            f"🔎 [DEBUG] {sig['symbol']}USDT\n"
-            f"Тренд 1H: {sig['trend_1h']} | Vol x{sig['volume_ratio']:.1f}\n"
-            f"RSI 5m: {sig['rsi5']:.0f} | RSI 15m: {sig['rsi15']:.0f}\n"
-            f"Score: {sig['score']}/5 | Цена: {sig['entry']:.6g}"
-        )
-    
     arrow = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
-    return f"Монета: {sig['symbol']}USDT | {arrow}\nTP: {sig['tp']:.6g}\nSL: {sig['sl']:.6g}"
+    return (
+        f"💎 SMC СИГНАЛ\n\n"
+        f"Монета: {sig['symbol']}USDT | {arrow}\n"
+        f"Вход: {sig['entry']:.6g}\n"
+        f"TP: {sig['tp']:.6g}\n"
+        f"SL: {sig['sl']:.6g}\n\n"
+        f"📊 ТЕХНИЧЕСКИЙ АНАЛИЗ:\n"
+        f"{sig['analysis']}"
+    )
 
 def send_telegram(token, chat_id, text):
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
@@ -214,25 +201,23 @@ def load_state(path):
 def save_state(path, state):
     with open(path, "w") as f: json.dump(state, f, indent=1)
 
-# ---------- main ----------
+# ---------- Main ----------
 def main(argv):
     P = load_params()
     dry = "--dry" in argv
     test = "--test" in argv
-    debug = "--debug" in argv # Наш новый флаг
-    
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
     if test:
-        msg = "✅ Бот запущен. Многофакторный анализ активен."
+        msg = "✅ SMC-Бот запущен. Анализ структуры и Order Blocks."
         if not dry and token and chat_id: send_telegram(token, chat_id, msg)
         print(msg)
         return 0
 
-    signals = scan_all(P, debug=debug)
+    signals = scan_all(P)
     if not signals:
-        print("Сигналов не найдено.")
+        print("SMC-сигналов не найдено.")
         return 0
 
     state = load_state(STATE_FILE)
@@ -243,6 +228,7 @@ def main(argv):
         msg = build_message(sig)
         if not dry and token and chat_id:
             send_telegram(token, chat_id, msg)
+            print(f"Отправлен SMC-сигнал: {sig['symbol']} {sig['side']}")
         else:
             print(msg + "\n---")
         state["sent"][key] = now
