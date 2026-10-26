@@ -20,19 +20,19 @@ def load_params():
         "timeframes": ["5m", "15m", "1h"],
         "limit": 200,
         "rsi_n": 14,
-        "rsi_long_max": 65,
-        "rsi_short_min": 35,
+        "rsi_long_max": 70,
+        "rsi_short_min": 30,
         "ema_fast": 9,
         "ema_slow": 21,
         "ema_trend": 50,
-        "vol_mult": 1.8,
+        "vol_mult": 1.3,
         "sl_atr_mult": 1.5,
         "rr": 2.0,
         "cooldown_min": 60,
         "max_alerts": 5,
         "min_turnover_usd": 20_000_000,
         "workers": 6,
-        "min_score": 3,
+        "min_score": 2,
     }
 
 # ---------- индикаторы на чистом pandas ----------
