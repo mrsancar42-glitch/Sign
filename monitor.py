@@ -15,14 +15,14 @@ FIXED_COINS = None if COINS_ENV in ("", "ALL") else [c.strip() for c in COINS_EN
 
 def load_params():
     return {
-        "timeframe": "15m",      
-        "limit": 150,            
-        "swing_length": 5,       
-        "ob_lookback": 20,       
-        "cooldown_min": 120,     
-        "max_alerts": 3,         
+        "timeframe": "1h",       # Классический SMC таймфрейм
+        "limit": 300,            # Глубина истории
+        "swing_length": 5,       # Чувствительность структуры
+        "cooldown_min": 240,     # Не спамить 4 часа
+        "max_alerts": 3,
         "min_turnover_usd": 30_000_000, 
         "workers": 6,
+        "min_rr": 2.0,           # Минимальный риск/прибыль 1:2
     }
 
 # ---------- Биржи ----------
@@ -63,83 +63,125 @@ def find_swings(df, length=5):
             swings.append({'type': 'low', 'price': df['low'].iloc[i], 'index': i})
     return swings
 
+def find_fvg(df, index, bullish=True):
+    """Ищет Fair Value Gap (Имбаланс) рядом с индексом"""
+    # Бычий FVG: low[i+1] > high[i-1] (разрыв между свечами)
+    # Медвежий FVG: high[i+1] < low[i-1]
+    if bullish:
+        if df['low'].iloc[index+1] > df['high'].iloc[index-1]:
+            return {"top": df['low'].iloc[index+1], "bottom": df['high'].iloc[index-1]}
+    else:
+        if df['high'].iloc[index+1] < df['low'].iloc[index-1]:
+            return {"top": df['low'].iloc[index-1], "bottom": df['high'].iloc[index+1]}
+    return None
+
 def analyze_smc(symbol, exchange, P):
     df = fetch_ohlcv(exchange, symbol, P["timeframe"], P["limit"])
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 100:
         return None
 
     swings = find_swings(df, P["swing_length"])
-    if len(swings) < 2:
+    if len(swings) < 4:
         return None
 
     current_price = df['close'].iloc[-1]
-    last_swing_high = next((s for s in reversed(swings) if s['type'] == 'high'), None)
-    last_swing_low = next((s for s in reversed(swings) if s['type'] == 'low'), None)
-
-    if not last_swing_high or not last_swing_low:
+    
+    highs = [s for s in swings if s['type'] == 'high']
+    lows = [s for s in swings if s['type'] == 'low']
+    
+    if len(highs) < 2 or len(lows) < 2:
         return None
+
+    last_swing_high = highs[-1]
+    last_swing_low = lows[-1]
+    prev_swing_high = highs[-2]
+    prev_swing_low = lows[-2]
 
     recent = df.iloc[-3:]
 
-    # СЦЕНАРИЙ 1: LONG (BOS вверх + откат к бычьему OB)
+    # --- СЦЕНАРИЙ 1: LONG ---
+    # Условие: Последний свинг был High (цена сломала структуру вверх)
     if last_swing_high['index'] > last_swing_low['index']:
-        for i in range(len(df) - 2, max(0, len(df) - P["ob_lookback"]), -1):
-            if df['close'].iloc[i] < df['open'].iloc[i]: # Медвежья свеча
-                if df['high'].iloc[i+1] > df['high'].iloc[i]: # Импульс вверх
+        # Ищем бычий FVG или OB (последняя медвежья свеча перед импульсом)
+        for i in range(len(df) - 2, max(0, len(df) - 30), -1):
+            if df['close'].iloc[i] < df['open'].iloc[i]:
+                if df['high'].iloc[i+1] > df['high'].iloc[i]:
+                    # Нашли OB
                     ob_high = df['high'].iloc[i]
                     ob_low = df['low'].iloc[i]
                     
-                    if recent['low'].min() <= ob_high and current_price > ob_low:
-                        sl = ob_low * 0.998 
-                        tp = last_swing_high['price'] 
+                    # Проверяем, есть ли FVG в этом же импульсе
+                    fvg = find_fvg(df, i, bullish=True)
+                    zone_high = fvg["top"] if fvg else ob_high
+                    zone_low = fvg["bottom"] if fvg else ob_low
+                    
+                    # Если цена откатилась в зону
+                    if recent['low'].min() <= zone_high and current_price > zone_low:
+                        sl = zone_low * 0.995 # Стоп за зону
+                        
+                        # Тейк: Предыдущий максимум (ликвидность)
+                        tp = prev_swing_high['price']
+                        if tp <= current_price: 
+                            tp = df['high'].iloc[-50:].max()
                         
                         risk = current_price - sl
                         reward = tp - current_price
-                        if risk > 0 and reward / risk >= 1.5:
+                        
+                        if risk > 0 and (reward / risk) >= P["min_rr"]:
+                            fvg_text = f" + FVG ({zone_low:.4g} - {zone_high:.4g})" if fvg else ""
                             return {
                                 "symbol": symbol.split("/")[0],
                                 "side": "LONG",
                                 "entry": current_price,
                                 "tp": tp,
                                 "sl": sl,
-                                "reason": "BOS Up + Bullish OB",
-                                # Детали для анализа
                                 "analysis": (
-                                    f"Структура: Пробой вверх (BOS) на {last_swing_high['price']:.4g}\n"
-                                    f"Зона входа: Бычий OB {ob_low:.4g} - {ob_high:.4g}\n"
-                                    f"Цель: Ликвидность на максимуме {tp:.4g}\n"
-                                    f"Риск/Прибыль: 1:{reward/risk:.1f}"
+                                    f"🔹 **Структура:** BOS Up (слом максимума) на {last_swing_high['price']:.4g}\n"
+                                    f"🔹 **Зона входа:** Бычий OB {ob_low:.4g} - {ob_high:.4g}{fvg_text}\n"
+                                    f"🔹 **Цель:** Ликвидность на максимуме {tp:.4g}\n"
+                                    f"🔹 **Потенциал:** {((tp/current_price)-1)*100:.1f}% (без плеча)\n"
+                                    f"🔹 **Риск/Прибыль:** 1:{reward/risk:.1f}"
                                 )
                             }
     
-    # СЦЕНАРИЙ 2: SHORT (BOS вниз + откат к медвежьему OB)
+    # --- СЦЕНАРИЙ 2: SHORT ---
+    # Условие: Последний свинг был Low (цена сломала структуру вниз)
     else:
-        for i in range(len(df) - 2, max(0, len(df) - P["ob_lookback"]), -1):
-            if df['close'].iloc[i] > df['open'].iloc[i]: # Бычья свеча
-                if df['low'].iloc[i+1] < df['low'].iloc[i]: # Импульс вниз
+        for i in range(len(df) - 2, max(0, len(df) - 30), -1):
+            if df['close'].iloc[i] > df['open'].iloc[i]:
+                if df['low'].iloc[i+1] < df['low'].iloc[i]:
                     ob_high = df['high'].iloc[i]
                     ob_low = df['low'].iloc[i]
                     
-                    if recent['high'].max() >= ob_low and current_price < ob_high:
-                        sl = ob_high * 1.002 
-                        tp = last_swing_low['price'] 
+                    fvg = find_fvg(df, i, bullish=False)
+                    zone_high = fvg["top"] if fvg else ob_high
+                    zone_low = fvg["bottom"] if fvg else ob_low
+                    
+                    if recent['high'].max() >= zone_low and current_price < zone_high:
+                        sl = zone_high * 1.005 # Стоп за зону
                         
+                        # Тейк: Предыдущий минимум (ликвидность)
+                        tp = prev_swing_low['price']
+                        if tp >= current_price: 
+                            tp = df['low'].iloc[-50:].min()
+                            
                         risk = sl - current_price
                         reward = current_price - tp
-                        if risk > 0 and reward / risk >= 1.5:
+                        
+                        if risk > 0 and (reward / risk) >= P["min_rr"]:
+                            fvg_text = f" + FVG ({zone_low:.4g} - {zone_high:.4g})" if fvg else ""
                             return {
                                 "symbol": symbol.split("/")[0],
                                 "side": "SHORT",
                                 "entry": current_price,
                                 "tp": tp,
                                 "sl": sl,
-                                "reason": "BOS Down + Bearish OB",
-                                # Детали для анализа
                                 "analysis": (
-                                    f"Структура: Пробой вниз (BOS) на {last_swing_low['price']:.4g}\n"
-                                    f"Зона входа: Медвежий OB {ob_low:.4g} - {ob_high:.4g}\n"
-                                    f"Цель: Ликвидность на минимуме {tp:.4g}\n"
-                                    f"Риск/Прибыль: 1:{reward/risk:.1f}"
+                                    f"🔹 **Структура:** BOS Down (слом минимума) на {last_swing_low['price']:.4g}\n"
+                                    f"🔹 **Зона входа:** Медвежий OB {ob_low:.4g} - {ob_high:.4g}{fvg_text}\n"
+                                    f"🔹 **Цель:** Ликвидность на минимуме {tp:.4g}\n"
+                                    f"🔹 **Потенциал:** {((current_price/tp)-1)*100:.1f}% (без плеча)\n"
+                                    f"🔹 **Риск/Прибыль:** 1:{reward/risk:.1f}"
                                 )
                             }
     return None
@@ -178,17 +220,17 @@ def scan_all(P):
 def build_message(sig):
     arrow = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
     return (
-        f"💎 SMC СИГНАЛ\n\n"
-        f"Монета: {sig['symbol']}USDT | {arrow}\n"
-        f"Вход: {sig['entry']:.6g}\n"
-        f"TP: {sig['tp']:.6g}\n"
-        f"SL: {sig['sl']:.6g}\n\n"
-        f"📊 ТЕХНИЧЕСКИЙ АНАЛИЗ:\n"
+        f"💎 **SMC СИГНАЛ (1H)**\n\n"
+        f"Монета: **{sig['symbol']}USDT** | {arrow}\n"
+        f"Вход: `{sig['entry']:.6g}`\n"
+        f"TP: `{sig['tp']:.6g}`\n"
+        f"SL: `{sig['sl']:.6g}`\n\n"
+        f"📊 **РАЗБОР СИТУАЦИИ:**\n"
         f"{sig['analysis']}"
     )
 
 def send_telegram(token, chat_id, text):
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
     with urllib.request.urlopen(req, timeout=15) as r:
         if not json.loads(r.read().decode()).get("ok"): raise RuntimeError("telegram error")
@@ -210,7 +252,7 @@ def main(argv):
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
     if test:
-        msg = "✅ SMC-Бот запущен. Анализ структуры и Order Blocks."
+        msg = "✅ SMC-Бот (1H) запущен. Ищу имбалансы и сломы структуры."
         if not dry and token and chat_id: send_telegram(token, chat_id, msg)
         print(msg)
         return 0
