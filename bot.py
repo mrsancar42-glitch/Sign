@@ -6,7 +6,6 @@ SYMBOLS = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','ADAUSDT',
            'NEARUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT',
            'TIAUSDT','DOGEUSDT']
 TOP_N = 6
-MIN_RR = 1.5
 
 def fetch(symbol):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
@@ -24,30 +23,25 @@ def calc_indicators(k):
     lows = [x[2] for x in k]
     vols = [x[4] for x in k]
     
-    # ATR
     trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])) for i in range(1, len(k))]
     atr = sum(trs[-14:])/14 if len(trs) >= 14 else 0
-    
-    # EMA 20/50
     ema20 = sum(closes[-20:])/20
     ema50 = sum(closes[-50:])/50
     
-    # RSI
     deltas = [closes[i]-closes[i-1] for i in range(1, len(closes))]
     gains = sum([d for d in deltas[-14:] if d > 0])/14
     losses = sum([-d for d in deltas[-14:] if d < 0])/14
     rsi = 100 - (100 / (1 + (gains/losses if losses > 0 else 100)))
     
-    # Bollinger
     sma20 = sum(closes[-20:])/20
     std20 = (sum([(c - sma20)**2 for c in closes[-20:]]) / 20) ** 0.5
     bb_low = sma20 - (2 * std20)
+    bb_up = sma20 + (2 * std20)
     
-    # Объем
     avg_vol = sum(vols[-20:])/20
 
     return {'close': closes[-1], 'ema20': ema20, 'ema50': ema50, 'rsi': rsi, 
-            'atr': atr, 'bb_low': bb_low, 'vol': vols[-1], 'avg_vol': avg_vol}
+            'atr': atr, 'bb_low': bb_low, 'bb_up': bb_up, 'vol': vols[-1], 'avg_vol': avg_vol}
 
 def analyze(symbol, k):
     if len(k) < 50: return None
@@ -55,23 +49,35 @@ def analyze(symbol, k):
     c, e20, e50, rsi, atr = ind['close'], ind['ema20'], ind['ema50'], ind['rsi'], ind['atr']
     if atr == 0: return None
 
-    # Стратегия 1: Тренд (Momentum)
-    if e20 > e50 and 40 < rsi < 55:
-        return {'sym': symbol, 'side': 'LONG', 'strat': 'Momentum', 'entry': c, 'tp': c + 2*atr, 'sl': c - 1*atr, 'rr': 2.0}
-    if e20 < e50 and 45 < rsi < 60:
-        return {'sym': symbol, 'side': 'SHORT', 'strat': 'Momentum', 'entry': c, 'tp': c - 2*atr, 'sl': c + 1*atr, 'rr': 2.0}
+    score = 0
+    side = "LONG" if e20 > e50 else "SHORT"
+    strat = "Trend"
 
-    # Стратегия 2: Откат (Mean Reversion)
-    if c <= ind['bb_low'] and rsi < 30:
-        return {'sym': symbol, 'side': 'LONG', 'strat': 'MeanRev', 'entry': c, 'tp': c + 1.5*atr, 'sl': c - 1*atr, 'rr': 1.5}
-    
-    # Стратегия 3: Пробой (Breakout)
-    if c > max([x[1] for x in k[-21:-1]]) and ind['vol'] > 1.5*ind['avg_vol']:
-         return {'sym': symbol, 'side': 'LONG', 'strat': 'Breakout', 'entry': c, 'tp': c + 2*atr, 'sl': c - 1*atr, 'rr': 2.0}
-    if c < min([x[2] for x in k[-21:-1]]) and ind['vol'] > 1.5*ind['avg_vol']:
-         return {'sym': symbol, 'side': 'SHORT', 'strat': 'Breakout', 'entry': c, 'tp': c - 2*atr, 'sl': c + 1*atr, 'rr': 2.0}
+    # 1. Оценка за тренд и RSI
+    if side == "LONG":
+        if 40 < rsi < 55: score += 4; strat = "Momentum"
+        elif rsi < 35: score += 3; strat = "MeanRev (Oversold)"
+        if c <= ind['bb_low']: score += 2; strat = "Bollinger Bounce"
+    else:
+        if 45 < rsi < 60: score += 4; strat = "Momentum"
+        elif rsi > 65: score += 3; strat = "MeanRev (Overbought)"
+        if c >= ind['bb_up']: score += 2; strat = "Bollinger Drop"
 
-    return None
+    # 2. Оценка за объем (всплеск)
+    if ind['vol'] > 1.5 * ind['avg_vol']: 
+        score += 2
+        strat += " + Vol"
+
+    # 3. Базовая оценка (чтобы слабые тоже попали в топ, если рынок скучный)
+    score += 1
+
+    # Формируем сделку
+    if side == 'LONG':
+        tp, sl = c + 2*atr, c - 1*atr
+    else:
+        tp, sl = c - 2*atr, c + 1*atr
+
+    return {'sym': symbol, 'side': side, 'strat': strat, 'entry': c, 'tp': tp, 'sl': sl, 'score': score}
 
 def send_tg(text):
     token = os.environ.get('TELEGRAM_TOKEN')
@@ -88,24 +94,25 @@ def send_tg(text):
 
 if __name__ == "__main__":
     print("Сканируем...")
-    signals = []
+    all_signals = []
     for sym in SYMBOLS:
         klines = fetch(sym)
         if klines:
             sig = analyze(sym, klines)
-            if sig: signals.append(sig)
+            if sig: all_signals.append(sig)
     
-    if not signals:
-        print("Нет сигналов.")
+    if not all_signals:
+        print("Нет данных.")
         exit()
 
-    signals.sort(key=lambda x: x['rr'], reverse=True)
-    top = signals[:TOP_N]
+    # Сортируем по количеству баллов (от лучших к худшим)
+    all_signals.sort(key=lambda x: x['score'], reverse=True)
+    top = all_signals[:TOP_N] # Берем ровно 6 штук
 
-    msg = "📡 Сигналы:\n\n"
+    msg = "📡 Топ-6 сигналов:\n\n"
     for s in top:
         emoji = "🟢" if s['side'] == 'LONG' else "🔴"
-        msg += f"{emoji} {s['sym']} | {s['side']}\n"
+        msg += f"{emoji} {s['sym']} | {s['side']} (Балл: {s['score']})\n"
         msg += f"Вход: {s['entry']:.4f} | TP: {s['tp']:.4f} | SL: {s['sl']:.4f}\n"
         msg += f"Стратегия: {s['strat']}\n\n"
 
