@@ -1,4 +1,4 @@
-name: Adaptive Ensemble Signal Bot
+name: Crypto Bot
 
 on:
   schedule:
@@ -6,10 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  scan-and-notify:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,7 +17,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run Adaptive Ensemble Bot
+      - name: Run script
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
