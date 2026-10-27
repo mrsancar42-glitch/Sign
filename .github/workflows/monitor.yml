@@ -1,4 +1,4 @@
-name: Adaptive Ensemble Signal Bot
+ name: Adaptive Ensemble Signal Bot
 
 on:
   schedule:
