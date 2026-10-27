@@ -1,11 +1,12 @@
 import os, json, time, urllib.request, urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 
 SYMBOLS = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','ADAUSDT',
            'AVAXUSDT','LINKUSDT','DOTUSDT','MATICUSDT','LTCUSDT','ATOMUSDT',
            'NEARUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT',
            'TIAUSDT','DOGEUSDT']
 TOP_N = 6
+MIN_RR = 2.0 # Жесткий фильтр: ТП должен быть минимум в 2 раза больше СЛ
 
 def fetch(symbol):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
@@ -37,11 +38,11 @@ def calc_indicators(k):
     std20 = (sum([(c - sma20)**2 for c in closes[-20:]]) / 20) ** 0.5
     bb_low = sma20 - (2 * std20)
     bb_up = sma20 + (2 * std20)
-    
     avg_vol = sum(vols[-20:])/20
 
     return {'close': closes[-1], 'ema20': ema20, 'ema50': ema50, 'rsi': rsi, 
-            'atr': atr, 'bb_low': bb_low, 'bb_up': bb_up, 'vol': vols[-1], 'avg_vol': avg_vol}
+            'atr': atr, 'bb_low': bb_low, 'bb_up': bb_up, 'vol': vols[-1], 'avg_vol': avg_vol,
+            'highs': highs, 'lows': lows}
 
 def analyze(symbol, k):
     if len(k) < 50: return None
@@ -53,47 +54,63 @@ def analyze(symbol, k):
     side = "LONG" if e20 > e50 else "SHORT"
     strat = "Trend"
 
-    # 1. Оценка за тренд и RSI
+    # Оценка
     if side == "LONG":
         if 40 < rsi < 55: score += 4; strat = "Momentum"
-        elif rsi < 35: score += 3; strat = "MeanRev (Oversold)"
-        if c <= ind['bb_low']: score += 2; strat = "Bollinger Bounce"
+        elif rsi < 35: score += 3; strat = "MeanRev"
+        if c <= ind['bb_low']: score += 2; strat = "Bollinger"
     else:
         if 45 < rsi < 60: score += 4; strat = "Momentum"
-        elif rsi > 65: score += 3; strat = "MeanRev (Overbought)"
-        if c >= ind['bb_up']: score += 2; strat = "Bollinger Drop"
+        elif rsi > 65: score += 3; strat = "MeanRev"
+        if c >= ind['bb_up']: score += 2; strat = "Bollinger"
 
-    # 2. Оценка за объем (всплеск)
     if ind['vol'] > 1.5 * ind['avg_vol']: 
         score += 2
-        strat += " + Vol"
-
-    # 3. Базовая оценка (чтобы слабые тоже попали в топ, если рынок скучный)
+        strat += "+Vol"
     score += 1
 
-    # Формируем сделку
+    # --- УМНЫЙ РАСЧЕТ SL и TP ---
     if side == 'LONG':
-        tp, sl = c + 2*atr, c - 1*atr
-    else:
-        tp, sl = c - 2*atr, c + 1*atr
+        # SL ставим под недавний минимум (последние 5 свечей) минус буфер ATR
+        local_low = min(ind['lows'][-5:])
+        sl = min(local_low - 0.5*atr, c - 1.0*atr)
+        
+        # TP ставим на недавний максимум (последние 30 свечей)
+        recent_highs = [h for h in ind['highs'][-30:] if h > c + (c - sl) * 1.5]
+        if recent_highs:
+            tp = min(recent_highs) # Ближайшее сопротивление
+        else:
+            tp = c + (c - sl) * 2.5 # Если максимумов нет, ставим по Фибо (1:2.5)
+            
+    else: # SHORT
+        local_high = max(ind['highs'][-5:])
+        sl = max(local_high + 0.5*atr, c + 1.0*atr)
+        
+        recent_lows = [l for l in ind['lows'][-30:] if l < c - (sl - c) * 1.5]
+        if recent_lows:
+            tp = max(recent_lows)
+        else:
+            tp = c - (sl - c) * 2.5
 
-    return {'sym': symbol, 'side': side, 'strat': strat, 'entry': c, 'tp': tp, 'sl': sl, 'score': score}
+    # Проверка R:R
+    rr = abs(tp - c) / abs(c - sl) if abs(c - sl) > 0 else 0
+    if rr < MIN_RR:
+        return None # Если ТП короткий — выкидываем нахуй этот сигнал
+
+    return {'sym': symbol, 'side': side, 'strat': strat, 'entry': c, 
+            'tp': tp, 'sl': sl, 'score': score, 'rr': round(rr, 2)}
 
 def send_tg(text):
     token = os.environ.get('TELEGRAM_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
-    if not token or not chat_id: 
-        print("Нет токена ТГ")
-        return
+    if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({'chat_id': chat_id, 'text': text}).encode()
     try:
         urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
-    except Exception as e:
-        print("TG Error:", e)
+    except: pass
 
 if __name__ == "__main__":
-    print("Сканируем...")
     all_signals = []
     for sym in SYMBOLS:
         klines = fetch(sym)
@@ -102,19 +119,21 @@ if __name__ == "__main__":
             if sig: all_signals.append(sig)
     
     if not all_signals:
-        print("Нет данных.")
+        print("Нет сигналов, проходящих по R:R.")
         exit()
 
-    # Сортируем по количеству баллов (от лучших к худшим)
     all_signals.sort(key=lambda x: x['score'], reverse=True)
-    top = all_signals[:TOP_N] # Берем ровно 6 штук
+    top = all_signals[:TOP_N]
 
-    msg = "📡 Топ-6 сигналов:\n\n"
+    msg = "📡 Топ сигналов (R:R >= 2.0):\n\n"
     for s in top:
         emoji = "🟢" if s['side'] == 'LONG' else "🔴"
+        pct = abs(s['tp'] - s['entry']) / s['entry'] * 100
         msg += f"{emoji} {s['sym']} | {s['side']} (Балл: {s['score']})\n"
-        msg += f"Вход: {s['entry']:.4f} | TP: {s['tp']:.4f} | SL: {s['sl']:.4f}\n"
-        msg += f"Стратегия: {s['strat']}\n\n"
+        msg += f"Вход: {s['entry']:.4f}\n"
+        msg += f"TP: {s['tp']:.4f} (+{pct:.2f}%)\n"
+        msg += f"SL: {s['sl']:.4f}\n"
+        msg += f"R:R: {s['rr']} | {s['strat']}\n\n"
 
     print(msg)
     send_tg(msg)
