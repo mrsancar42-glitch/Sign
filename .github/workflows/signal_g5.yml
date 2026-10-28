@@ -1,12 +1,12 @@
-name: Signal G5 Monitor
+name: Signal G5 V3 Monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: signal-g5-monitor
@@ -16,17 +16,60 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Run signal scanner
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Run Signal G5
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
         run: python signal_g5.py
+
+      - name: Persist deduplication state
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          if [ -f signal_g5_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add signal_g5_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update Signal G5 state [skip ci]"
+              git push
+            fi
+          fi
+
+### Перед запуском проверь
+
+В корне репозитория должны находиться:
+
+```text
+signal_g5.py
+signal_g5_state.json
+.github/
+└── workflows/
+    └── signal_g5.yml
+
+В GitHub открой Settings → Secrets and variables → Actions и проверь наличие двух секретов:
+
+- "TELEGRAM_TOKEN"
+- "TELEGRAM_CHAT_ID"
+
+Важно: этот YAML запускает сканер каждые 15 минут и сохраняет файл состояния между запусками. Но защита от повторных сигналов будет работать только в том случае, если сам "signal_g5.py" корректно читает и обновляет "signal_g5_state.json". Также GitHub Actions может задерживать запланированные запуски, поэтому интервал не гарантирован до минуты.
