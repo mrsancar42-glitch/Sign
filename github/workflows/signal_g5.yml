@@ -1,0 +1,56 @@
+name: Signal G5 V4 Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signal-g5-v4
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run Signal G5 V4
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python signal_g5.py
+
+      - name: Persist monitor state
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          if [ -f signal_g5_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add signal_g5_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: update Signal G5 V4 state [skip ci]"
+              git push
+            else
+              echo "State unchanged; nothing to commit."
+            fi
+          fi
