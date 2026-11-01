@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Signal G6 — OKX Swing Scanner (среднесрок: дни–недели, свечи 1D + 4H)
+Signal G5 — OKX Swing Scanner (среднесрок: дни–недели, свечи 1D + 4H)
 
 Что делает:
   * берёт ликвидные USDT-перпетуалы OKX;
