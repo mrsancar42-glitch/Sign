@@ -1,6 +1,8 @@
-
 {
-  "cursors": {},
+  "cursors": {
+    "OKX": 40,
+    "BINGX": 40,
+    "BITUNIX": 40
+  },
   "sent": []
-}
 }
