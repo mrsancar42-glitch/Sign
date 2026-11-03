@@ -11,27 +11,28 @@ from zoneinfo import ZoneInfo
 import ccxt
 import requests
 
-# ==================================================
-# ICT FUTURES PRO
-# Public market data only. No automatic trading.
-# ==================================================
+# =====================================================
+# ICT FUTURES SCANNER PRO
+# Exchanges: OKX / BingX / Bitunix
+# Markets: USDT linear perpetual futures ONLY
+# No spot. No Bybit. No automatic trading.
+# =====================================================
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-TZ = ZoneInfo("Europe/Istanbul")
+TIMEZONE = ZoneInfo("Europe/Istanbul")
 
 TIMEFRAME = "15m"
-HTF = "1h"
+HTF_TIMEFRAME = "1h"
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "40"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "72"))
-MIN_RR = 2.0
 
 STATE_FILE = Path("state.json")
 BITUNIX_URL = "https://fapi.bitunix.com"
 
-EXCHANGES = ("okx", "bingx", "bybit")
+EXCHANGES = ("okx", "bingx")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,33 +40,49 @@ logging.basicConfig(
 )
 
 http = requests.Session()
-http.headers.update({"User-Agent": "ICT-Futures-Scanner/1.0"})
+http.headers.update({
+    "User-Agent": "ICT-Futures-Scanner/2.0"
+})
 
 
-# ---------------- TIME ----------------
+# =====================================================
+# TIME
+# =====================================================
 
-def is_quiet():
-    hour = datetime.now(TZ).hour
+def is_quiet_hours():
+    hour = datetime.now(TIMEZONE).hour
     return hour < 6
 
 
-# ---------------- STATE ----------------
+# =====================================================
+# STATE
+# =====================================================
 
 def load_state():
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
+
         return {
             "cursors": data.get("cursors", {}),
             "sent": data.get("sent", [])
         }
+
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"cursors": {}, "sent": []}
+        return {
+            "cursors": {},
+            "sent": []
+        }
 
 
 def save_state(state):
     state["sent"] = state["sent"][-5000:]
 
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     fd, temp_name = tempfile.mkstemp(
         dir=str(STATE_FILE.parent),
@@ -73,10 +90,17 @@ def save_state(state):
     )
 
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
+        with os.fdopen(
+            fd, "w", encoding="utf-8"
+        ) as file:
+            json.dump(
+                state,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+            file.flush()
+            os.fsync(file.fileno())
 
         os.replace(temp_name, STATE_FILE)
 
@@ -85,13 +109,15 @@ def save_state(state):
             os.remove(temp_name)
 
 
-# ---------------- TELEGRAM ----------------
+# =====================================================
+# TELEGRAM
+# =====================================================
 
-def telegram(message):
+def send_telegram(message):
     response = http.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={
-            "chat_id": CHAT_ID,
+            "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "disable_web_page_preview": True
         },
@@ -103,74 +129,112 @@ def telegram(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError(f"Telegram error: {result}")
+        raise RuntimeError(
+            f"Telegram API error: {result}"
+        )
 
 
-# ---------------- EXCHANGES ----------------
+# =====================================================
+# CCXT EXCHANGES
+# =====================================================
 
-def make_exchange(name):
-    exchange_class = getattr(ccxt, name)
+def create_exchange(exchange_name):
+    exchange_class = getattr(ccxt, exchange_name)
 
     return exchange_class({
         "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": "swap"}
+        "timeout": 25000,
+        "options": {
+            "defaultType": "swap"
+        }
     })
 
 
-def ccxt_markets(exchange):
-    markets = exchange.load_markets()
-    result = {}
+def get_futures_markets(exchange):
+    """
+    Return ONLY active USDT linear perpetual markets.
+    Spot, inverse futures and dated futures are excluded.
+    """
 
-    for market in markets.values():
-        if (
-            market.get("active") is not False
-            and market.get("swap") is True
-            and market.get("linear") is True
-            and market.get("quote") == "USDT"
-            and market.get("settle") == "USDT"
-        ):
-            result[market["base"]] = market["symbol"]
+    all_markets = exchange.load_markets()
+    futures = {}
 
-    return result
+    for market in all_markets.values():
+
+        if market.get("active") is False:
+            continue
+
+        if market.get("swap") is not True:
+            continue
+
+        if market.get("linear") is not True:
+            continue
+
+        if market.get("quote") != "USDT":
+            continue
+
+        if market.get("settle") != "USDT":
+            continue
+
+        if not market.get("base") or not market.get("symbol"):
+            continue
+
+        futures[market["base"]] = market["symbol"]
+
+    return futures
 
 
-# ---------------- BITUNIX ----------------
+# =====================================================
+# BITUNIX PUBLIC FUTURES API
+# =====================================================
 
 def bitunix_get(path, params=None):
+
     response = http.get(
         BITUNIX_URL + path,
         params=params or {},
-        timeout=20
+        timeout=25
     )
 
     response.raise_for_status()
+
     result = response.json()
 
     if result.get("code") != 0:
-        raise RuntimeError(f"Bitunix API error: {result}")
+        raise RuntimeError(
+            f"Bitunix API error: {result}"
+        )
 
     return result.get("data", [])
 
 
-def bitunix_markets():
+def get_bitunix_futures_markets():
+
     rows = bitunix_get(
         "/api/v1/futures/market/trading_pairs"
     )
 
-    result = {}
+    markets = {}
 
     for row in rows:
-        if (
-            row.get("quote") == "USDT"
-            and row.get("symbolStatus") == "OPEN"
-        ):
-            result[row["base"]] = row["symbol"]
 
-    return result
+        if row.get("quote") != "USDT":
+            continue
+
+        if row.get("symbolStatus") != "OPEN":
+            continue
+
+        base = row.get("base")
+        symbol = row.get("symbol")
+
+        if base and symbol:
+            markets[base] = symbol
+
+    return markets
 
 
-def bitunix_candles(symbol):
+def get_bitunix_candles(symbol):
+
     rows = bitunix_get(
         "/api/v1/futures/market/kline",
         {
@@ -184,6 +248,7 @@ def bitunix_candles(symbol):
     candles = []
 
     for row in rows:
+
         candles.append([
             int(row["time"]),
             float(row["open"]),
@@ -193,36 +258,53 @@ def bitunix_candles(symbol):
             float(row.get("baseVol", 0))
         ])
 
-    return sorted(candles, key=lambda x: x[0])
+    candles.sort(key=lambda candle: candle[0])
+
+    # Official Bitunix endpoint returns closed candles.
+    return candles
 
 
-# ---------------- INDICATORS ----------------
-
-def true_range(current, previous):
-    return max(
-        current[2] - current[3],
-        abs(current[2] - previous[4]),
-        abs(current[3] - previous[4])
-    )
-
+# =====================================================
+# ATR
+# =====================================================
 
 def calculate_atr(candles, period=14):
+
+    if len(candles) < period + 1:
+        return 0
+
     ranges = []
 
     for i in range(-period, 0):
-        ranges.append(
-            true_range(candles[i], candles[i - 1])
+
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current[2] - current[3],
+            abs(current[2] - previous[4]),
+            abs(current[3] - previous[4])
         )
+
+        ranges.append(tr)
 
     return sum(ranges) / len(ranges)
 
 
-def get_htf_bias(exchange):
+# =====================================================
+# BTC MARKET BIAS
+# =====================================================
+
+def get_btc_bias(exchange):
+
     try:
+
+        symbol = "BTC/USDT:USDT"
+
         candles = exchange.fetch_ohlcv(
-            "BTC/USDT:USDT",
-            timeframe=HTF,
-            limit=40
+            symbol,
+            timeframe=HTF_TIMEFRAME,
+            limit=50
         )
 
         closed = candles[:-1]
@@ -231,6 +313,7 @@ def get_htf_bias(exchange):
             return "NEUTRAL"
 
         closes = [x[4] for x in closed]
+
         sma = sum(closes[-20:]) / 20
 
         if closes[-1] > sma:
@@ -240,37 +323,50 @@ def get_htf_bias(exchange):
             return "BEARISH"
 
     except Exception:
-        logging.exception("BTC HTF analysis failed")
+        logging.exception(
+            "BTC bias unavailable"
+        )
 
     return "NEUTRAL"
 
 
-# ---------------- ICT ANALYSIS ----------------
+# =====================================================
+# ICT SIGNAL ENGINE
+# =====================================================
 
 def analyze_ict(candles, already_closed=False):
+
     if not candles or len(candles) < 35:
         return None
 
-    # CCXT's latest candle can still be forming.
-    # Bitunix endpoint returns closed candles only.
-    data = candles if already_closed else candles[:-1]
+    # Exclude currently forming candle on CCXT.
+    # Bitunix returns closed candles already.
+    data = (
+        candles
+        if already_closed
+        else candles[:-1]
+    )
 
     if len(data) < 30:
         return None
 
     current = data[-1]
-    ts, open_price, high, low, close, volume = current
+
+    timestamp = current[0]
+    open_price = current[1]
+    high = current[2]
+    low = current[3]
+    close = current[4]
+    volume = current[5]
 
     lookback = data[-22:-2]
-
-    if len(lookback) < 20:
-        return None
 
     range_high = max(x[2] for x in lookback)
     range_low = min(x[3] for x in lookback)
 
     avg_body = sum(
-        abs(x[4] - x[1]) for x in lookback
+        abs(x[4] - x[1])
+        for x in lookback
     ) / len(lookback)
 
     avg_volume = sum(
@@ -282,28 +378,44 @@ def analyze_ict(candles, already_closed=False):
     if atr <= 0 or avg_body <= 0:
         return None
 
-    candle_body = abs(close - open_price)
-    candle_range = max(high - low, 1e-12)
+    body = abs(close - open_price)
 
-    # Liquidity sweep
-    bull_sweep = low < range_low and close > range_low
-    bear_sweep = high > range_high and close < range_high
+    candle_range = max(
+        high - low,
+        1e-12
+    )
 
-    # Displacement
-    displacement = candle_body >= avg_body * 1.35
+    # 1. Liquidity Sweep
+    bull_sweep = (
+        low < range_low
+        and close > range_low
+    )
 
-    # Fair Value Gap
+    bear_sweep = (
+        high > range_high
+        and close < range_high
+    )
+
+    # 2. Displacement
+    displacement = body >= avg_body * 1.35
+
+    # 3. Fair Value Gap
     bull_fvg = low > data[-3][2]
     bear_fvg = high < data[-3][3]
 
-    # Market Structure Shift
-    recent_high = max(x[2] for x in data[-7:-1])
-    recent_low = min(x[3] for x in data[-7:-1])
+    # 4. Market Structure Shift
+    local_high = max(
+        x[2] for x in data[-7:-1]
+    )
 
-    bull_mss = close > recent_high
-    bear_mss = close < recent_low
+    local_low = min(
+        x[3] for x in data[-7:-1]
+    )
 
-    # Strong candle close
+    bull_mss = close > local_high
+    bear_mss = close < local_low
+
+    # 5. Candle close strength
     bull_close = (
         close > open_price
         and (high - close) / candle_range < 0.30
@@ -314,7 +426,7 @@ def analyze_ict(candles, already_closed=False):
         and (close - low) / candle_range < 0.30
     )
 
-    # Relative volume
+    # 6. Volume
     volume_ok = (
         avg_volume > 0
         and volume >= avg_volume * 0.75
@@ -346,6 +458,7 @@ def analyze_ict(candles, already_closed=False):
     entry = close
 
     if direction == "LONG":
+
         sl = low - atr * 0.15
         risk = entry - sl
 
@@ -359,6 +472,7 @@ def analyze_ict(candles, already_closed=False):
         ]
 
     else:
+
         sl = high + atr * 0.15
         risk = sl - entry
 
@@ -371,7 +485,7 @@ def analyze_ict(candles, already_closed=False):
             entry - risk * 4
         ]
 
-    # Transparent heuristic score, not win probability.
+    # Heuristic score, NOT win probability.
     score = 60
 
     if volume_ok:
@@ -389,72 +503,92 @@ def analyze_ict(candles, already_closed=False):
         "sl": sl,
         "targets": targets,
         "score": min(score, 85),
-        "timestamp": int(ts),
+        "timestamp": int(timestamp),
         "volume_ok": volume_ok,
         "atr": atr
     }
 
 
-# ---------------- SIGNAL MESSAGE ----------------
+# =====================================================
+# SIGNAL MESSAGE
+# =====================================================
 
-def fmt(number):
-    return f"{number:.8g}"
+def fmt(value):
+    return f"{value:.8g}"
 
 
-def make_message(base, source, signal, bias):
+def create_signal_message(
+    base,
+    exchange_name,
+    signal,
+    btc_bias
+):
+
     direction = signal["direction"]
 
-    emoji = "🟢" if direction == "LONG" else "🔴"
+    emoji = (
+        "🟢" if direction == "LONG"
+        else "🔴"
+    )
 
-    timestamp = datetime.fromtimestamp(
+    signal_time = datetime.fromtimestamp(
         signal["timestamp"] / 1000,
-        TZ
+        TIMEZONE
     ).strftime("%d.%m.%Y %H:%M")
 
     return (
         f"⚡ ICT FUTURES PRO\n\n"
         f"{emoji} {direction} | {base}/USDT\n"
-        f"Source: {source}\n"
-        f"Bybit perpetual: VERIFIED\n"
+        f"Exchange: {exchange_name}\n"
+        f"Market: USDT PERPETUAL\n"
         f"Timeframe: {TIMEFRAME}\n"
-        f"BTC 1H: {bias}\n\n"
-        f"ICT SCORE: {signal['score']}/100\n\n"
+        f"BTC 1H Bias: {btc_bias}\n\n"
+        f"⭐ ICT SCORE: {signal['score']}/100\n\n"
         f"ENTRY: {fmt(signal['entry'])}\n"
         f"STOP LOSS: {fmt(signal['sl'])}\n\n"
         f"TP1: {fmt(signal['targets'][0])}\n"
         f"TP2: {fmt(signal['targets'][1])}\n"
         f"TP3: {fmt(signal['targets'][2])}\n\n"
         f"Risk/Reward: 1:2 / 1:3 / 1:4\n"
-        f"Volume confirmation: "
-        f"{'YES' if signal['volume_ok'] else 'NO'}\n\n"
-        f"Conditions:\n"
+        f"Volume: "
+        f"{'CONFIRMED' if signal['volume_ok'] else 'WEAK'}\n\n"
+        f"ICT CONDITIONS:\n"
         f"✓ Liquidity Sweep\n"
         f"✓ Displacement\n"
-        f"✓ FVG\n"
-        f"✓ MSS\n\n"
-        f"Closed candle: {timestamp} Istanbul\n\n"
-        f"⚠️ Analytical setup, not a profit guarantee."
+        f"✓ Fair Value Gap\n"
+        f"✓ Market Structure Shift\n\n"
+        f"Closed candle: {signal_time}\n"
+        f"Time zone: Istanbul\n\n"
+        f"⚠️ Analytical signal. "
+        f"Not a guarantee of profit."
     )
 
 
-# ---------------- ROTATING SCANNER ----------------
+# =====================================================
+# ROTATING MARKET SCANNER
+# =====================================================
 
-def scan_source(
-    name,
+def scan_exchange(
+    exchange_name,
     markets,
     state,
-    bybit_bases,
     btc_bias,
     exchange=None,
     bitunix=False
 ):
-    bases = sorted(set(markets.keys()) & bybit_bases)
+
+    bases = sorted(markets.keys())
 
     if not bases:
-        logging.warning("%s: no matching Bybit contracts", name)
+        logging.warning(
+            "%s: no eligible futures",
+            exchange_name
+        )
         return
 
-    cursor = int(state["cursors"].get(name, 0)) % len(bases)
+    cursor = int(
+        state["cursors"].get(exchange_name, 0)
+    ) % len(bases)
 
     count = min(BATCH_SIZE, len(bases))
 
@@ -463,33 +597,46 @@ def scan_source(
         for i in range(count)
     ]
 
-    state["cursors"][name] = (cursor + count) % len(bases)
+    state["cursors"][exchange_name] = (
+        (cursor + count) % len(bases)
+    )
 
     logging.info(
-        "%s: %d eligible markets, checking %d",
-        name, len(bases), len(batch)
+        "%s: %d futures, scanning %d",
+        exchange_name,
+        len(bases),
+        len(batch)
     )
 
     for base in batch:
+
         try:
+
             if bitunix:
-                candles = bitunix_candles(markets[base])
+
+                candles = get_bitunix_candles(
+                    markets[base]
+                )
+
                 signal = analyze_ict(
                     candles,
                     already_closed=True
                 )
+
             else:
+
                 candles = exchange.fetch_ohlcv(
                     markets[base],
                     timeframe=TIMEFRAME,
                     limit=100
                 )
+
                 signal = analyze_ict(candles)
 
-            if not signal:
+            if signal is None:
                 continue
 
-            # HTF BTC direction adjusts the score.
+            # BTC bias is a soft filter.
             if (
                 btc_bias == "BULLISH"
                 and signal["direction"] == "SHORT"
@@ -505,114 +652,172 @@ def scan_source(
             if signal["score"] < MIN_SCORE:
                 continue
 
-            # One notification per coin/direction/candle,
-            # even when several exchanges see the same setup.
+            # Deduplication by coin, direction and candle.
             key = (
-                f"{base}:{signal['direction']}:"
+                f"{base}:"
+                f"{signal['direction']}:"
                 f"{signal['timestamp']}"
             )
 
             if key in state["sent"]:
                 continue
 
-            message = make_message(
-                base, name, signal, btc_bias
+            message = create_signal_message(
+                base,
+                exchange_name,
+                signal,
+                btc_bias
             )
 
-            # Do not record a signal until Telegram confirms.
-            telegram(message)
+            send_telegram(message)
 
             state["sent"].append(key)
+
             save_state(state)
 
-            logging.info("Signal sent: %s", key)
+            logging.info(
+                "Telegram signal sent: %s",
+                key
+            )
 
         except Exception as error:
+
             logging.warning(
-                "%s / %s: %s",
-                name, base, error
+                "%s %s failed: %s",
+                exchange_name,
+                base,
+                error
             )
 
-        time.sleep(0.15)
+        # Respect public API rate limits.
+        time.sleep(0.20)
 
 
-# ---------------- MAIN ----------------
+# =====================================================
+# MAIN
+# =====================================================
 
 def main():
+
     state = load_state()
 
-    # Quiet hours still preserve scanner progress.
-    if is_quiet():
-        logging.info("Quiet hours in Istanbul. No notifications.")
-        return
-
-    bybit = make_exchange("bybit")
-
-    try:
-        bybit_markets = ccxt_markets(bybit)
-        bybit_bases = set(bybit_markets)
+    if is_quiet_hours():
 
         logging.info(
-            "Bybit USDT perpetual universe: %d",
-            len(bybit_bases)
+            "Quiet hours: Telegram notifications disabled."
         )
 
-        btc_bias = get_htf_bias(bybit)
+        return
 
-        logging.info("BTC 1H bias: %s", btc_bias)
+    # OKX provides the BTC reference trend.
+    okx = None
 
-        for name in EXCHANGES:
-            exchange = None
+    try:
 
-            try:
-                exchange = (
-                    bybit if name == "bybit"
-                    else make_exchange(name)
-                )
+        okx = create_exchange("okx")
 
-                markets = ccxt_markets(exchange)
+        # Load only the exchange's available market metadata.
+        okx_markets = get_futures_markets(okx)
 
-                scan_source(
-                    name.upper(),
-                    markets,
-                    state,
-                    bybit_bases,
-                    btc_bias,
-                    exchange=exchange
-                )
+        btc_bias = get_btc_bias(okx)
 
-                save_state(state)
+        logging.info(
+            "OKX futures: %d",
+            len(okx_markets)
+        )
 
-            except Exception:
-                logging.exception("%s failed", name)
+        logging.info(
+            "BTC 1H bias: %s",
+            btc_bias
+        )
 
-            finally:
-                if exchange is not None and exchange is not bybit:
-                    exchange.close()
-
-        # Dedicated Bitunix public API adapter.
-        try:
-            markets = bitunix_markets()
-
-            scan_source(
-                "BITUNIX",
-                markets,
-                state,
-                bybit_bases,
-                btc_bias,
-                bitunix=True
-            )
-
-        except Exception:
-            logging.exception("Bitunix failed")
+        # OKX
+        scan_exchange(
+            "OKX",
+            okx_markets,
+            state,
+            btc_bias,
+            exchange=okx
+        )
 
         save_state(state)
 
+    except Exception:
+
+        logging.exception(
+            "OKX scanner failed"
+        )
+
+        btc_bias = "NEUTRAL"
+
+    # BingX
+    bingx = None
+
+    try:
+
+        bingx = create_exchange("bingx")
+
+        bingx_markets = get_futures_markets(bingx)
+
+        logging.info(
+            "BingX futures: %d",
+            len(bingx_markets)
+        )
+
+        scan_exchange(
+            "BINGX",
+            bingx_markets,
+            state,
+            btc_bias,
+            exchange=bingx
+        )
+
+        save_state(state)
+
+    except Exception:
+
+        logging.exception(
+            "BingX scanner failed"
+        )
+
     finally:
-        bybit.close()
+
+        if bingx is not None:
+            bingx.close()
+
+    # Bitunix
+    try:
+
+        bitunix_markets = get_bitunix_futures_markets()
+
+        logging.info(
+            "Bitunix futures: %d",
+            len(bitunix_markets)
+        )
+
+        scan_exchange(
+            "BITUNIX",
+            bitunix_markets,
+            state,
+            btc_bias,
+            bitunix=True
+        )
+
+        save_state(state)
+
+    except Exception:
+
+        logging.exception(
+            "Bitunix scanner failed"
+        )
+
+    finally:
+
+        if okx is not None:
+            okx.close()
+
         http.close()
 
 
 if __name__ == "__main__":
     main()
-  
