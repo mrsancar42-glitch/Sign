@@ -1,40 +1,50 @@
 
-name: GPT 2.2 QUANT INTELLIGENCE
+name: GPT 2.2 Quant Intelligence
 
 on:
   schedule:
-    # Istanbul: 07:05–23:50 (UTC+3)
-    - cron: "5,20,35,50 4-20 * * *"
+    - cron: "*/15 * * * *"
+
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: gpt-22-quant
+  group: gpt-22-bot
   cancel-in-progress: false
 
 jobs:
-  scanner:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: main
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          cache: "pip"
+
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: gpt22-state-${{ github.run_id }}
+          restore-keys: |
+            gpt22-state-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install ccxt pandas numpy requests
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile gpt_2_2.py
 
       - name: Run GPT 2.2
         env:
@@ -44,16 +54,5 @@ jobs:
           MAX_SYMBOLS: "60"
           MAX_DAILY_SIGNALS: "12"
           MIN_QUOTE_VOLUME: "2000000"
-          PYTHONUNBUFFERED: "1"
-        run: python gpt_2_2.py
-
-      - name: Save persistent bot state
-        if: always()
         run: |
-          git config user.name "GPT 2.2 Bot"
-          git config user.email "gpt-22-bot@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || {
-            git commit -m "GPT 2.2: update trading state"
-            git push origin HEAD:main
-          }
+          python -u gpt_2_2.py
