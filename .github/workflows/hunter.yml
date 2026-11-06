@@ -1,0 +1,57 @@
+
+name: GPT 5.0 HUNTER
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Scan every 15 minutes
+    - cron: "*/15 * * * *"
+
+    # Daily report: 23:50 Istanbul (UTC+3)
+    - cron: "50 20 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hunter-main
+  cancel-in-progress: false
+
+jobs:
+  hunter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas numpy requests mplfinance matplotlib
+
+      - name: Check Python syntax
+        run: python -m py_compile hunter_5.py
+
+      - name: Run HUNTER
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_SCORE: "75"
+          MAX_SYMBOLS: "25"
+          MIN_VOLUME: "2000000"
+        run: python hunter_5.py
+
+      - name: Save signal history
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "HUNTER: update signal history"
+          file_pattern: hunter_state.json
+          
