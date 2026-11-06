@@ -1,0 +1,72 @@
+name: GPT 3.0 Quant Intelligence
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpt-30-quant
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: gpt30-state-${{ github.run_id }}
+          restore-keys: |
+            gpt30-state-
+
+      - name: Initialize state
+        run: |
+          if [ ! -f state.json ]; then
+            echo '{"signals":{},"daily":{},"news_hashes":[],"last_run":null}' > state.json
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas numpy requests beautifulsoup4
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile gpt_3_0.py
+
+      - name: Run GPT 3.0
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          MIN_SCORE: "78"
+          MAX_SYMBOLS: "60"
+          MAX_DAILY_SIGNALS: "12"
+          MIN_QUOTE_VOLUME: "2000000"
+
+          MIN_RR_TP1: "1.2"
+          MIN_RR_TP2: "2.0"
+          MIN_RR_TP3: "3.0"
+
+          MAX_STOP_ATR: "3.0"
+
+        run: |
+          python -u gpt_3_0.py
+          
