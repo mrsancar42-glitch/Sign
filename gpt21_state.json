@@ -1,0 +1,23 @@
+{
+  "sent": [
+    "bingx|KII/USDT:USDT|SHORT|1793989800000",
+    "bingx|NCSKOKLO2USD/USDT:USDT|LONG|1793989800000"
+  ],
+  "daily": {},
+  "last_scan": {
+    "okx": {
+      "time": "2026-11-06T21:49:56.382816+03:00",
+      "markets_found": 528,
+      "markets_scanned": 525,
+      "signals_sent": 0,
+      "errors": 0
+    },
+    "bingx": {
+      "time": "2026-11-06T21:56:40.150317+03:00",
+      "markets_found": 1131,
+      "markets_scanned": 919,
+      "signals_sent": 2,
+      "errors": 41
+    }
+  }
+}
