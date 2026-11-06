@@ -782,17 +782,11 @@ def monitor_signals(state, exchanges):
                 signal["status"] = "COMPLETED"
 
         except Exception as e:
-            log.warning(
-                "Monitor %s: %s",
-                   if signal.get("tp3_hit"):
-            signal["status"] = "COMPLETED"
-
-        except Exception as e:
-            log.warning(
-                "Monitor %s: %s",
-                signal.get("symbol", "UNKNOWN"),
-                e
-            )
+    log.warning(
+        "Monitor %s: %s",
+        signal.get("symbol", "UNKNOWN"),
+        e
+    )
 
 
 # ============================================================
