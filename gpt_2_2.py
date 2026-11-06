@@ -927,7 +927,145 @@ def scan_exchange(
                     min(100, score)
                 )
 
+                
                 if score < MIN_SCORE:
                     continue
+
+                signal = create_signal(
+                    exchange,
+                    symbol,
+                    side,
+                    score,
+                    reasons,
+                    df15
+                )
+
+                if not signal:
+                    continue
+
+                duplicate = any(
+                    x.get("symbol") == symbol
+                    and x.get("exchange") == exchange.id.upper()
+                    and x.get("status") == "OPEN"
+                    for x in state["signals"].values()
+                    if isinstance(x, dict)
+                )
+
+                if duplicate:
+                    continue
+
+                if signal["id"] in state["signals"]:
+                    continue
+
+                if telegram(signal_message(signal)):
+                    state["signals"][signal["id"]] = signal
+
+                    daily_count += 1
+                    state["daily"][daily_key] = daily_count
+
+                    save_state(state)
+
+                    log.info(
+                        "Signal sent: %s %s %s",
+                        symbol,
+                        side,
+                        score
+                    )
+
+        except Exception as e:
+            log.warning(
+                "Symbol scan failed %s: %s",
+                symbol,
+                e
+            )
+
+
+# ============================================================
+# NEWS NOTIFICATIONS
+# ============================================================
+
+def send_news(news, state):
+
+    hashes = set(state.get("news_hashes", []))
+
+    for item in news:
+
+        key = hashlib.sha256(
+            item["title"].encode("utf-8")
+        ).hexdigest()
+
+        if key in hashes:
+            continue
+
+        title = item["title"]
+
+        if any(x in title.lower() for x in [
+            "bitcoin", "btc", "ethereum", "crypto",
+            "cryptocurrency", "etf", "sec",
+            "exchange", "бтк", "биткоин", "крипто"
+        ]):
+
+            if telegram(
+                f"📰 CRYPTO MARKET NEWS\n\n"
+                f"{title}\n\n{item['link']}"
+            ):
+                hashes.add(key)
+
+    state["news_hashes"] = list(hashes)[-500:]
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    log.info("Starting GPT %s", VERSION)
+
+    if quiet_hours():
+        log.info("Night pause: Istanbul 00:00-07:00")
+        return
+
+    state = load_state()
+
+    exchanges = {}
+
+    for name in ("bingx", "okx"):
+        try:
+            exchanges[name] = make_exchange(name)
+        except Exception as e:
+            log.error("Exchange init %s: %s", name, e)
+
+    if not exchanges:
+        raise RuntimeError("No exchanges available")
+
+    monitor_signals(state, exchanges)
+    save_state(state)
+
+    news = get_news()
+    mood, relevant = news_analysis(news)
+
+    send_news(news, state)
+
+    for exchange in exchanges.values():
+        btc = btc_regime(exchange)
+
+        scan_exchange(
+            exchange,
+            state,
+            btc,
+            mood
+        )
+
+    state["last_run"] = now().isoformat()
+
+    save_state(state)
+
+    log.info("GPT %s finished successfully", VERSION)
+
+
+if __name__ == "__main__":
+    main()
+    
 
      
